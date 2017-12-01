@@ -9,9 +9,16 @@ import (
 	"github.com/brutella/hc"
 	"github.com/brutella/hc/accessory"
 	"github.com/brutella/hc/characteristic"
+	"github.com/brutella/hc/service"
 	"github.com/brutella/log"
 
 	"github.com/ablyler/nest"
+)
+
+const (
+	AlarmOk        = "ok"
+	AlarmWarning   = "warning"
+	AlarmEmergency = "emergency"
 )
 
 type HKThermostat struct {
@@ -21,17 +28,24 @@ type HKThermostat struct {
 	thermostat *accessory.Thermostat
 }
 
+type HKSmokeCoAlarm struct {
+	accessory *accessory.Accessory
+	transport hc.Transport
+}
+
 var (
-	thermostats   map[string]*HKThermostat
-	nestPin       string
-	nestToken     string
-	homekitPin    string
-	productId     string
-	productSecret string
-	state         string
+	thermostats      map[string]*HKThermostat
+	smokeCoDetectors map[string]*HKSmokeCoAlarm
+	structuresChan   chan map[string]*nest.Structure
+	nestPin          string
+	nestToken        string
+	homekitPin       string
+	productId        string
+	productSecret    string
+	state            string
 )
 
-func logEvent(device *nest.Thermostat) {
+func logEvent(device *nest.SmokeCoAlarm) {
 	data, _ := json.MarshalIndent(device, "", "  ")
 	fmt.Println(string(data))
 }
@@ -42,6 +56,7 @@ func Connect() {
 	if nestToken == "" {
 		client.Authorize()
 	}
+	fmt.Printf("This is the client token: ")
 	fmt.Println(client.Token)
 
 	client.DevicesStream(func(devices *nest.Devices, err error) {
@@ -50,41 +65,81 @@ func Connect() {
 			os.Exit(1)
 		}
 
-		for _, device := range devices.Thermostats {
-			logEvent(device)
-
-			hkThermostat := GetHKThermostat(device)
-			hkThermostat.thermostat.Thermostat.CurrentTemperature.SetValue(float64(device.AmbientTemperatureC))
-			hkThermostat.thermostat.Thermostat.TargetTemperature.SetValue(float64(device.TargetTemperatureC))
-
-			var targetMode int
-
-			switch device.HvacMode {
-			case "heat":
-				targetMode = characteristic.TargetHeatingCoolingStateHeat
-			case "cool":
-				targetMode = characteristic.TargetHeatingCoolingStateCool
-			case "off":
-				targetMode = characteristic.TargetHeatingCoolingStateOff
-			default:
-				targetMode = characteristic.TargetHeatingCoolingStateAuto
-			}
-
-			hkThermostat.thermostat.Thermostat.TargetHeatingCoolingState.SetValue(targetMode)
-
-			var mode int
-
-			switch device.HvacState {
-			case "heating":
-				mode = characteristic.CurrentHeatingCoolingStateHeat
-			case "cooling":
-				mode = characteristic.CurrentHeatingCoolingStateCool
-			default:
-				mode = characteristic.CurrentHeatingCoolingStateOff
-			}
-			hkThermostat.thermostat.Thermostat.CurrentHeatingCoolingState.SetValue(mode)
+		for _, device := range devices.SmokeCoAlarms {
+			hkSmokeCODetector := GetHKSmokeAlarm(device)
+			services := hkSmokeCODetector.accessory.Services
+			fmt.Printf("Services: %v\n", services)
+			// smokeState := characteristic.NewCharacteristic(characteristic.TypeSmokeDetected)
+			// coState := characteristic.NewCharacteristic(characteristic.TypeCarbonMonoxideDetected)
+			//
+			// switch device.CoAlarmState {
+			// case AlarmOk:
+			// 	coState.UpdateValue(characteristic.CarbonMonoxideDetectedCOLevelsNormal)
+			// case AlarmWarning, AlarmEmergency:
+			// 	coState.UpdateValue(characteristic.CarbonMonoxideDetectedCOLevelsAbnormal)
+			// }
+			//
+			// switch device.SmokeAlarmState {
+			// case AlarmOk:
+			// 	smokeState.UpdateValue(characteristic.SmokeDetectedSmokeNotDetected)
+			// case AlarmWarning, AlarmEmergency:
+			// 	smokeState.UpdateValue(characteristic.SmokeDetectedSmokeDetected)
+			// }
+			//
+			// for _, svc := range services {
+			// 	switch svc.Type {
+			// 	case service.TypeCarbonMonoxideSensor:
+			// 		svc.AddCharacteristic(coState)
+			// 	case service.TypeSmokeSensor:
+			// 		svc.AddCharacteristic(smokeState)
+			// 	}
+			// }
 		}
 	})
+}
+
+func GetHKSmokeAlarm(nestSmokeAlarm *nest.SmokeCoAlarm) *HKSmokeCoAlarm {
+	log.Printf("[INFO] Creating New HKSmokeDetector for %s", nestSmokeAlarm.Name)
+
+	hkSmokeCoAlarm, found := smokeCoDetectors[nestSmokeAlarm.DeviceID]
+	if found {
+		return hkSmokeCoAlarm
+	}
+
+	info := accessory.Info{
+		Name:         "Protect",
+		Manufacturer: "Nest",
+		Model:        "Protect",
+		SerialNumber: "Numbers",
+	}
+
+	smokeCoDetector := accessory.New(info, accessory.TypeSensor)
+	smokeDectection := service.NewSmokeSensor()
+	coDetection := service.NewCarbonMonoxideSensor()
+
+	smokeDectection.AddCharacteristic(characteristic.NewBatteryLevel().Characteristic)
+
+	smokeCoDetector.AddService(smokeDectection.Service)
+	smokeCoDetector.AddService(coDetection.Service)
+
+	config := hc.Config{Pin: "00102003"}
+	transport, err := hc.NewIPTransport(config, smokeCoDetector)
+	if err != nil {
+		log.Fatal("Failed to connect to HC transport", err)
+	}
+
+	hc.OnTermination(func() {
+		<-transport.Stop()
+	})
+
+	go func() {
+		transport.Start()
+	}()
+
+	hkSmokeCoAlarm = &HKSmokeCoAlarm{smokeCoDetector, transport}
+	smokeCoDetectors[nestSmokeAlarm.DeviceID] = hkSmokeCoAlarm
+
+	return hkSmokeCoAlarm
 }
 
 func GetHKThermostat(nestThermostat *nest.Thermostat) *HKThermostat {
@@ -139,6 +194,8 @@ func GetHKThermostat(nestThermostat *nest.Thermostat) *HKThermostat {
 
 func main() {
 	thermostats = map[string]*HKThermostat{}
+	smokeCoDetectors = map[string]*HKSmokeCoAlarm{}
+	structuresChan = make(chan map[string]*nest.Structure)
 
 	productIdArg := flag.String("product-id", "", "Nest provided product id")
 	productSecretArg := flag.String("product-secret", "", "Nest provided product secret")
@@ -149,6 +206,8 @@ func main() {
 	verboseArg := flag.Bool("v", false, "Whether or not log output is displayed")
 
 	flag.Parse()
+
+	fmt.Printf("inside let's go!\n")
 
 	productId = *productIdArg
 	productSecret = *productSecretArg
@@ -166,5 +225,6 @@ func main() {
 		os.Exit(1)
 	})
 
+	fmt.Printf("about to connect\n")
 	Connect()
 }
